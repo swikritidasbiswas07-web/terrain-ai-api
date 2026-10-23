@@ -2,9 +2,9 @@ import asyncio
 import json
 import os
 from datetime import datetime, timedelta, timezone
-from math import atan2, cos, radians, sin, sqrt
+from math import atan2, cos, isfinite, radians, sin, sqrt
 from typing import Any
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -16,10 +16,15 @@ from pydantic import BaseModel, Field
 # TERRAIN CONFIGURATION
 # ============================================================
 
+APP_VERSION = "3.4.0"
+
 app = FastAPI(
     title="Terrain Outdoor Activity API",
-    version="2.0.0",
-    description="Evidence-grounded outdoor recommendations using live geospatial and weather data with local Qwen AI.",
+    version=APP_VERSION,
+    description=(
+        "Evidence-grounded outdoor recommendations using live "
+        "geospatial and weather data with optional local Qwen AI."
+    ),
 )
 
 app.add_middleware(
@@ -31,13 +36,15 @@ app.add_middleware(
 )
 
 NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+
 OVERPASS_ENDPOINTS = [
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kumi.systems/api/interpreter",
 ]
-OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 
-USER_AGENT = "TerrainOutdoorAssistant/2.0 (outdoor activity research project)"
+OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
+USER_AGENT = "TerrainOutdoorAssistant/3.2 (outdoor activity research project)"
+INDIA_TIMEZONE = "Asia/Kolkata"
 
 OLLAMA_URL = os.getenv(
     "TERRAIN_OLLAMA_URL",
@@ -65,11 +72,170 @@ class RecommendationQuery(BaseModel):
 
 
 # ============================================================
-# UTILITIES
+# FEATURE CLASSIFICATION
+# ============================================================
+
+# Exact OpenStreetMap tag/value pairs only.
+# A generic "leisure", "sport", or "boundary" tag is not enough.
+
+OVERPASS_FEATURE_TAGS = {
+    "leisure": {
+        "park",
+        "garden",
+        "pitch",
+        "golf_course",
+        "playground",
+        "track",
+        "sports_centre",
+        "nature_reserve",
+        "common",
+    },
+    "landuse": {
+        "recreation_ground",
+    },
+    "natural": {
+        "wood",
+        "forest",
+        "heath",
+        "scrub",
+    },
+    "tourism": {
+        "picnic_site",
+    },
+    "boundary": {
+        "national_park",
+        "protected_area",
+    },
+}
+
+NOMINATIM_FEATURE_TYPES = {
+    ("leisure", "park"): "park",
+    ("leisure", "garden"): "garden",
+    ("leisure", "pitch"): "pitch",
+    ("leisure", "golf_course"): "golf_course",
+    ("leisure", "playground"): "playground",
+    ("leisure", "track"): "track",
+    ("leisure", "sports_centre"): "sports_centre",
+    ("leisure", "nature_reserve"): "nature_reserve",
+    ("leisure", "common"): "common",
+    ("landuse", "recreation_ground"): "recreation_ground",
+    ("natural", "wood"): "wood",
+    ("natural", "forest"): "forest",
+    ("natural", "heath"): "heath",
+    ("natural", "scrub"): "scrub",
+    ("tourism", "picnic_site"): "picnic_site",
+    ("boundary", "national_park"): "national_park",
+    ("boundary", "protected_area"): "protected_area",
+}
+
+PREFERRED_TYPES = {
+    "running": {"park", "recreation_ground", "track"},
+    "jogging": {"park", "recreation_ground", "track"},
+    "walking": {
+        "park", "garden", "recreation_ground", "wood",
+        "forest", "heath", "nature_reserve", "national_park",
+        "common",
+    },
+    "cycling": {
+        "park", "recreation_ground", "track", "wood",
+        "forest", "cycleway",
+    },
+    "golf": {"golf_course"},
+    "cricket": {"pitch", "recreation_ground"},
+    "football": {"pitch", "recreation_ground"},
+    "soccer": {"pitch", "recreation_ground"},
+    "tennis": {"pitch", "sports_centre"},
+    "hiking": {
+        "wood", "forest", "heath", "park", "nature_reserve",
+        "national_park", "protected_area",
+    },
+    "picnic": {
+        "picnic_site", "park", "garden", "recreation_ground",
+    },
+    "outdoor events": {
+        "park", "garden", "recreation_ground",
+    },
+    "photography": {
+        "park", "garden", "wood", "forest", "heath",
+        "nature_reserve", "national_park",
+    },
+}
+
+
+ACTIVITY_ALIASES = {
+    "run": "running",
+    "running": "running",
+    "jog": "jogging",
+    "jogging": "jogging",
+    "walk": "walking",
+    "walking": "walking",
+    "bike": "cycling",
+    "biking": "cycling",
+    "cycle": "cycling",
+    "cycling": "cycling",
+    "golfing": "golf",
+    "golf": "golf",
+    "cricket": "cricket",
+    "football": "football",
+    "soccer": "soccer",
+    "tennis": "tennis",
+    "hike": "hiking",
+    "hiking": "hiking",
+    "picnicking": "picnic",
+    "picnic": "picnic",
+    "outdoor event": "outdoor events",
+    "outdoor events": "outdoor events",
+    "photography": "photography",
+}
+
+
+def normalize_activity(activity):
+    """Normalize common activity names and aliases."""
+    text = (activity or "").strip().lower()
+    return ACTIVITY_ALIASES.get(text, text)
+
+
+def filter_places_for_activity(places, activity):
+    """Filter known activities by mapped place type, without substitutions."""
+    activity_key = normalize_activity(activity)
+    preferred_types = PREFERRED_TYPES.get(activity_key)
+
+    if not preferred_types:
+        return places, None
+
+    filtered_places = [
+        place
+        for place in places
+        if (place.get("type") or "").strip().lower() in preferred_types
+    ]
+    excluded_count = len(places) - len(filtered_places)
+
+    if not filtered_places:
+        note = (
+            f"No nearby places with mapped feature types matching "
+            f"{activity_key!r} were found within the requested radius. "
+            "Try increasing the radius or choosing another activity. "
+            "Unrelated places have not been substituted."
+        )
+    elif excluded_count:
+        note = (
+            f"Excluded {excluded_count} place(s) whose mapped feature "
+            f"types do not match {activity_key!r}. A mapped feature type "
+            "does not prove that a venue permits or is suitable for this "
+            "activity."
+        )
+    else:
+        note = None
+
+    return filtered_places, note
+
+
+# ============================================================
+# GENERAL UTILITIES
 # ============================================================
 
 def haversine_km(lat1, lon1, lat2, lon2):
-    """Calculate straight-line distance between two coordinates."""
+    """Straight-line distance between two geographic coordinates."""
     earth_radius_km = 6371.0
 
     dlat = radians(lat2 - lat1)
@@ -95,6 +261,21 @@ def at(data: dict, key: str, index: int) -> Any:
     return values[index] if index < len(values) else None
 
 
+def valid_coordinates(lat, lon):
+    try:
+        lat = float(lat)
+        lon = float(lon)
+    except (TypeError, ValueError):
+        return False
+
+    return (
+        isfinite(lat)
+        and isfinite(lon)
+        and -90 <= lat <= 90
+        and -180 <= lon <= 180
+    )
+
+
 def source_record(source_id, name, url, retrieved_at):
     return {
         "id": source_id,
@@ -106,7 +287,6 @@ def source_record(source_id, name, url, retrieved_at):
 
 
 def weather_description(code):
-    """Convert Open-Meteo weather codes to readable descriptions."""
     descriptions = {
         0: "Clear sky",
         1: "Mainly clear",
@@ -144,6 +324,119 @@ def weather_description(code):
         return None
 
 
+def is_india_location(lat, lon):
+    return 6.0 <= lat <= 37.5 and 68.0 <= lon <= 97.5
+
+
+def timezone_for_location(lat, lon, api_timezone=None):
+    """Use India Standard Time in India, otherwise the API timezone."""
+    if is_india_location(lat, lon):
+        return INDIA_TIMEZONE
+
+    if api_timezone:
+        try:
+            ZoneInfo(api_timezone)
+            return api_timezone
+        except (ValueError, KeyError, ZoneInfoNotFoundError):
+            pass
+
+    return "UTC"
+
+
+def parse_datetime(value, local_tz):
+    parsed = datetime.fromisoformat(value)
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=local_tz)
+
+    return parsed.astimezone(local_tz)
+
+
+def normalize_feature_type(tags):
+    """
+    Return a recognized feature type from exact OSM tag/value pairs.
+
+    Never use a generic sport/leisure/boundary category as a type.
+    """
+    priority = [
+        "leisure",
+        "landuse",
+        "tourism",
+        "natural",
+        "boundary",
+    ]
+
+    for key in priority:
+        value = str(tags.get(key, "")).strip().lower()
+
+        if value in OVERPASS_FEATURE_TAGS.get(key, set()):
+            return value
+
+    return None
+
+
+def valid_place_name(value):
+    if not isinstance(value, str):
+        return None
+
+    name = " ".join(value.split()).strip()
+
+    if not name or len(name) > 180:
+        return None
+
+    if name.lower() in {
+        "unknown", "unnamed", "null", "none", "park", "garden",
+    }:
+        return None
+
+    return name
+
+
+def normalize_osm_place(element, origin_lat, origin_lon, radius_km):
+    tags = element.get("tags") or {}
+    feature_type = normalize_feature_type(tags)
+
+    if not feature_type:
+        return None
+
+    name = valid_place_name(tags.get("name"))
+
+    if not name:
+        return None
+
+    center = element.get("center") or {}
+    p_lat = element.get("lat", center.get("lat"))
+    p_lon = element.get("lon", center.get("lon"))
+
+    if not valid_coordinates(p_lat, p_lon):
+        return None
+
+    p_lat = float(p_lat)
+    p_lon = float(p_lon)
+    distance = haversine_km(origin_lat, origin_lon, p_lat, p_lon)
+
+    if distance > radius_km:
+        return None
+
+    osm_type = element.get("type")
+    osm_id = element.get("id")
+
+    if not osm_type or osm_id is None:
+        return None
+
+    place_id = f"osm-{osm_type}-{osm_id}"
+
+    return {
+        "id": place_id,
+        "name": name,
+        "type": feature_type,
+        "lat": p_lat,
+        "lon": p_lon,
+        "distance_km": round(distance, 2),
+        "travel_time_min": None,
+    }
+
+
 # ============================================================
 # API STATUS
 # ============================================================
@@ -167,7 +460,6 @@ def health():
 
 @app.get("/model-status")
 async def model_status():
-    """Check whether the local Ollama model is available."""
     if not OLLAMA_ENABLED:
         return {
             "enabled": False,
@@ -175,7 +467,10 @@ async def model_status():
             "model": OLLAMA_MODEL,
         }
 
-    tags_url = OLLAMA_URL.rsplit("/api/generate", 1)[0] + "/api/tags"
+    tags_url = (
+        OLLAMA_URL.rsplit("/api/generate", 1)[0]
+        + "/api/tags"
+    )
 
     try:
         async with httpx.AsyncClient(timeout=5) as client:
@@ -214,10 +509,9 @@ async def model_status():
 # ============================================================
 
 def parse_time_window(request, timezone_name):
-    """Interpret explicit times or common phrases such as tomorrow morning."""
     try:
         local_tz = ZoneInfo(timezone_name)
-    except Exception:
+    except (ValueError, KeyError, ZoneInfoNotFoundError):
         local_tz = timezone.utc
 
     now = datetime.now(local_tz)
@@ -233,20 +527,9 @@ def parse_time_window(request, timezone_name):
 
     if request.start and request.end:
         try:
-            start_dt = datetime.fromisoformat(request.start)
-            end_dt = datetime.fromisoformat(request.end)
-
-            if start_dt.tzinfo is None:
-                start_dt = start_dt.replace(tzinfo=local_tz)
-            else:
-                start_dt = start_dt.astimezone(local_tz)
-
-            if end_dt.tzinfo is None:
-                end_dt = end_dt.replace(tzinfo=local_tz)
-            else:
-                end_dt = end_dt.astimezone(local_tz)
-
-        except ValueError:
+            start_dt = parse_datetime(request.start, local_tz)
+            end_dt = parse_datetime(request.end, local_tz)
+        except (ValueError, TypeError, OverflowError):
             return None, "Could not interpret the supplied start/end dates."
 
     else:
@@ -282,7 +565,6 @@ def parse_time_window(request, timezone_name):
             datetime.min.time().replace(hour=start_hour),
             tzinfo=local_tz,
         )
-
         end_dt = datetime.combine(
             target_day,
             datetime.min.time().replace(hour=end_hour),
@@ -308,13 +590,17 @@ async def geocode_location(client, request):
         lon = request.coords.get("lon")
 
         if lat is not None and lon is not None:
-            if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            if not valid_coordinates(lat, lon):
                 raise HTTPException(
                     status_code=422,
                     detail="Coordinates are outside valid ranges.",
                 )
 
-            return lat, lon, f"Coordinates: {lat}, {lon}"
+            return (
+                float(lat),
+                float(lon),
+                f"Coordinates: {lat}, {lon}",
+            )
 
     if not request.location or not request.location.strip():
         raise HTTPException(
@@ -322,19 +608,25 @@ async def geocode_location(client, request):
             detail="Please enter a city, place, or valid coordinates.",
         )
 
-    response = await client.get(
-        NOMINATIM_URL,
-        params={
-            "q": request.location.strip(),
-            "format": "jsonv2",
-            "limit": 1,
-        },
-        headers={"User-Agent": USER_AGENT},
-        timeout=20,
-    )
+    try:
+        response = await client.get(
+            NOMINATIM_URL,
+            params={
+                "q": request.location.strip(),
+                "format": "jsonv2",
+                "limit": 1,
+            },
+            headers={"User-Agent": USER_AGENT},
+            timeout=20,
+        )
+        response.raise_for_status()
+        results = response.json()
 
-    response.raise_for_status()
-    results = response.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail="The location lookup service is temporarily unavailable.",
+        ) from exc
 
     if not results:
         raise HTTPException(
@@ -343,6 +635,12 @@ async def geocode_location(client, request):
         )
 
     result = results[0]
+
+    if not valid_coordinates(result.get("lat"), result.get("lon")):
+        raise HTTPException(
+            status_code=502,
+            detail="The location service returned invalid coordinates.",
+        )
 
     return (
         float(result["lat"]),
@@ -356,70 +654,26 @@ async def geocode_location(client, request):
 # ============================================================
 
 async def find_nearby_places(client, lat, lon, radius_km):
-    """Use OpenStreetMap Overpass, with Nominatim fallback."""
+    """
+    Search Overpass first, then use Nominatim if Overpass fails
+    or produces no validated outdoor places.
+    """
     radius_m = int(radius_km * 1000)
     last_error = None
-
-    def normalize_overpass(elements):
-        found = {}
-
-        for element in elements:
-            tags = element.get("tags", {})
-            name = tags.get("name")
-
-            if not name:
-                continue
-
-            center = element.get("center", {})
-            p_lat = element.get("lat", center.get("lat"))
-            p_lon = element.get("lon", center.get("lon"))
-
-            if p_lat is None or p_lon is None:
-                continue
-
-            p_lat = float(p_lat)
-            p_lon = float(p_lon)
-
-            distance = haversine_km(lat, lon, p_lat, p_lon)
-
-            if distance > radius_km:
-                continue
-
-            place_id = (
-                f"osm-{element.get('type', 'feature')}-"
-                f"{element.get('id', '')}"
-            )
-
-            found[place_id] = {
-                "id": place_id,
-                "name": name,
-                "type": (
-                    tags.get("leisure")
-                    or tags.get("sport")
-                    or tags.get("natural")
-                    or tags.get("landuse")
-                    or tags.get("tourism")
-                ),
-                "lat": p_lat,
-                "lon": p_lon,
-                "distance_km": round(distance, 2),
-                "travel_time_min": None,
-            }
-
-        return found
 
     query = f"""
     [out:json][timeout:25];
     (
-      nwr(around:{radius_m},{lat},{lon})["leisure"~"park|garden|pitch|golf_course|playground"];
+      nwr(around:{radius_m},{lat},{lon})["leisure"~"^(park|garden|pitch|golf_course|playground|track|sports_centre|nature_reserve|common)$"];
       nwr(around:{radius_m},{lat},{lon})["landuse"="recreation_ground"];
-      nwr(around:{radius_m},{lat},{lon})["natural"~"wood|heath|scrub"];
+      nwr(around:{radius_m},{lat},{lon})["natural"~"^(wood|forest|heath|scrub)$"];
       nwr(around:{radius_m},{lat},{lon})["tourism"="picnic_site"];
-      nwr(around:{radius_m},{lat},{lon})["sport"];
+      nwr(around:{radius_m},{lat},{lon})["boundary"~"^(national_park|protected_area)$"];
     );
     out center tags;
     """
 
+    # Try both Overpass endpoints. Do not stop on an empty/invalid result.
     for endpoint in OVERPASS_ENDPOINTS:
         try:
             response = await client.post(
@@ -428,38 +682,53 @@ async def find_nearby_places(client, lat, lon, radius_km):
                 headers={"Content-Type": "text/plain"},
                 timeout=35,
             )
-
             response.raise_for_status()
+            payload = response.json()
 
-            places_by_id = normalize_overpass(
-                response.json().get("elements", [])
-            )
+            elements = payload.get("elements", [])
+            places_by_id = {}
+
+            for element in elements:
+                place = normalize_osm_place(
+                    element, lat, lon, radius_km
+                )
+                if place:
+                    places_by_id[place["id"]] = place
 
             places = sorted(
                 places_by_id.values(),
                 key=lambda item: item["distance_km"],
             )
 
-            print(f"Overpass succeeded: {len(places)} places found.")
-            return places[:30], None
+            if places:
+                print(
+                    f"Overpass succeeded: {len(places)} validated places."
+                )
+                return places[:30], None
 
-        except (httpx.HTTPError, ValueError) as exc:
+            last_error = (
+                "Overpass returned no places matching the strict "
+                "outdoor-feature validation rules."
+            )
+            print(last_error)
+
+        except (httpx.HTTPError, ValueError, TypeError) as exc:
             last_error = str(exc)
             print(f"Overpass failed: {last_error}")
 
-    # Fallback searches, bounded to a geographic box around the location.
+    # Nominatim fallback. Accept exact category/type combinations only.
     lat_delta = radius_km / 111.0
     lon_delta = radius_km / max(
         111.0 * abs(cos(radians(lat))),
         0.01,
     )
 
-    viewbox = (
-        f"{max(-180, lon - lon_delta)},"
-        f"{min(90, lat + lat_delta)},"
-        f"{min(180, lon + lon_delta)},"
-        f"{max(-90, lat - lat_delta)}"
-    )
+    left = max(-180, lon - lon_delta)
+    right = min(180, lon + lon_delta)
+    top = min(90, lat + lat_delta)
+    bottom = max(-90, lat - lat_delta)
+
+    viewbox = f"{left},{top},{right},{bottom}"
 
     search_terms = [
         "park",
@@ -469,17 +738,6 @@ async def find_nearby_places(client, lat, lon, radius_km):
         "picnic site",
         "nature reserve",
     ]
-
-    allowed_categories = {
-        "leisure", "natural", "tourism", "landuse", "boundary"
-    }
-
-    allowed_types = {
-        "park", "garden", "golf_course", "pitch", "sports_centre",
-        "recreation_ground", "picnic_site", "nature_reserve", "wood",
-        "heath", "forest", "national_park", "playground", "track",
-        "common", "protected_area",
-    }
 
     fallback_places = {}
 
@@ -500,41 +758,43 @@ async def find_nearby_places(client, lat, lon, radius_km):
                 headers={"User-Agent": USER_AGENT},
                 timeout=20,
             )
-
             response.raise_for_status()
 
             for result in response.json():
-                try:
-                    p_lat = float(result["lat"])
-                    p_lon = float(result["lon"])
-                except (KeyError, TypeError, ValueError):
+                category = str(result.get("category", "")).lower()
+                feature_type = str(result.get("type", "")).lower()
+
+                normalized_type = NOMINATIM_FEATURE_TYPES.get(
+                    (category, feature_type)
+                )
+
+                if not normalized_type:
                     continue
 
+                name = valid_place_name(
+                    result.get("name")
+                    or result.get("display_name", "").split(",")[0]
+                )
+
+                if not name:
+                    continue
+
+                if not valid_coordinates(
+                    result.get("lat"), result.get("lon")
+                ):
+                    continue
+
+                p_lat = float(result["lat"])
+                p_lon = float(result["lon"])
                 distance = haversine_km(lat, lon, p_lat, p_lon)
 
                 if distance > radius_km:
                     continue
 
-                category = result.get("category", "")
-                feature_type = result.get("type", "")
-
-                if (
-                    category not in allowed_categories
-                    and feature_type not in allowed_types
-                ):
-                    continue
-
-                name = result.get("name") or result.get(
-                    "display_name", ""
-                ).split(",")[0].strip()
-
-                if not name:
-                    continue
-
                 osm_type = result.get("osm_type")
                 osm_id = result.get("osm_id")
 
-                if osm_type and osm_id:
+                if osm_type and osm_id is not None:
                     place_id = f"osm-{osm_type}-{osm_id}"
                 else:
                     place_id = f"nominatim-{result.get('place_id')}"
@@ -542,18 +802,14 @@ async def find_nearby_places(client, lat, lon, radius_km):
                 fallback_places[place_id] = {
                     "id": place_id,
                     "name": name,
-                    "type": (
-                        feature_type
-                        or category
-                        or term.replace(" ", "_")
-                    ),
+                    "type": normalized_type,
                     "lat": p_lat,
                     "lon": p_lon,
                     "distance_km": round(distance, 2),
                     "travel_time_min": None,
                 }
 
-        except (httpx.HTTPError, ValueError) as exc:
+        except (httpx.HTTPError, ValueError, TypeError) as exc:
             last_error = str(exc)
             print(f"Nominatim fallback failed for {term}: {last_error}")
 
@@ -562,12 +818,15 @@ async def find_nearby_places(client, lat, lon, radius_km):
         key=lambda item: item["distance_km"],
     )
 
-    print(f"Nominatim fallback: {len(places)} places found.")
+    print(f"Nominatim fallback: {len(places)} validated places found.")
 
     if places:
         return places[:30], None
 
-    return [], last_error or "No nearby mapped outdoor places were found."
+    return (
+        [],
+        last_error or "No validated nearby outdoor places were found.",
+    )
 
 
 # ============================================================
@@ -575,7 +834,10 @@ async def find_nearby_places(client, lat, lon, radius_km):
 # ============================================================
 
 async def get_weather(client, lat, lon):
-    """Fetch actual hourly forecast values from Open-Meteo."""
+    requested_timezone = (
+        INDIA_TIMEZONE if is_india_location(lat, lon) else "auto"
+    )
+
     response = await client.get(
         OPEN_METEO_URL,
         params={
@@ -586,7 +848,7 @@ async def get_weather(client, lat, lon):
                 "wind_speed_10m,wind_direction_10m,weather_code,is_day"
             ),
             "forecast_days": 3,
-            "timezone": "auto",
+            "timezone": requested_timezone,
         },
         timeout=30,
     )
@@ -598,6 +860,8 @@ async def get_weather(client, lat, lon):
 
     for i, timestamp in enumerate(hourly.get("time", [])):
         code = at(hourly, "weather_code", i)
+        is_day = at(hourly, "is_day", i)
+
         points.append({
             "time": timestamp,
             "weather": weather_description(code),
@@ -610,13 +874,11 @@ async def get_weather(client, lat, lon):
             "wind_dir_deg": at(hourly, "wind_direction_10m", i),
             "aqi": None,
             "is_daylight": (
-                bool(at(hourly, "is_day", i))
-                if at(hourly, "is_day", i) is not None
-                else None
+                bool(is_day) if is_day is not None else None
             ),
         })
 
-    return points, payload.get("timezone", "UTC")
+    return points, payload.get("timezone")
 
 
 # ============================================================
@@ -624,10 +886,9 @@ async def get_weather(client, lat, lon):
 # ============================================================
 
 def choose_forecast_window(hourly_points, time_window, timezone_name):
-    """Choose a lower-risk forecast hour without claiming guaranteed safety."""
     try:
         local_tz = ZoneInfo(timezone_name)
-    except Exception:
+    except (ValueError, KeyError, ZoneInfoNotFoundError):
         local_tz = timezone.utc
 
     now_local = datetime.now(local_tz).replace(tzinfo=None)
@@ -639,7 +900,6 @@ def choose_forecast_window(hourly_points, time_window, timezone_name):
             requested_start = datetime.fromisoformat(
                 time_window["start"]
             ).replace(tzinfo=None)
-
             requested_end = datetime.fromisoformat(
                 time_window["end"]
             ).replace(tzinfo=None)
@@ -659,7 +919,7 @@ def choose_forecast_window(hourly_points, time_window, timezone_name):
         if point_dt < now_local:
             continue
 
-        if requested_start and requested_end:
+        if requested_start is not None and requested_end is not None:
             if not requested_start <= point_dt < requested_end:
                 continue
         elif point_dt > now_local + timedelta(hours=48):
@@ -671,7 +931,10 @@ def choose_forecast_window(hourly_points, time_window, timezone_name):
         daylight = point.get("is_daylight")
 
         risk = 0.0
-        risk += min(60.0, float(rain) * 0.6) if rain is not None else 20.0
+        risk += (
+            min(60.0, float(rain) * 0.6)
+            if rain is not None else 20.0
+        )
         risk += (
             min(30.0, max(0.0, float(wind) - 12.0))
             if wind is not None else 8.0
@@ -741,23 +1004,6 @@ def choose_forecast_window(hourly_points, time_window, timezone_name):
 # DETERMINISTIC RANKING
 # ============================================================
 
-PREFERRED_TYPES = {
-    "running": {"park", "garden", "recreation_ground", "wood", "forest", "track"},
-    "jogging": {"park", "garden", "recreation_ground", "wood", "track"},
-    "walking": {"park", "garden", "recreation_ground", "wood", "forest", "playground"},
-    "cycling": {"park", "wood", "recreation_ground", "track", "cycleway"},
-    "golf": {"golf_course"},
-    "cricket": {"pitch", "recreation_ground"},
-    "football": {"pitch", "recreation_ground"},
-    "soccer": {"pitch", "recreation_ground"},
-    "tennis": {"pitch", "sports_centre"},
-    "hiking": {"wood", "heath", "park", "forest", "nature_reserve", "national_park"},
-    "picnic": {"picnic_site", "park", "garden"},
-    "outdoor events": {"park", "garden", "recreation_ground"},
-    "photography": {"park", "garden", "wood", "heath", "nature_reserve"},
-}
-
-
 def make_rankings(
     places,
     activity,
@@ -766,10 +1012,15 @@ def make_rankings(
     timezone_name,
     radius_km,
 ):
-    preferred = PREFERRED_TYPES.get(
-        (activity or "").lower().strip(),
-        set(),
-    )
+    activity_key = normalize_activity(activity)
+    preferred = PREFERRED_TYPES.get(activity_key, set())
+
+    # Defensive filtering keeps direct callers consistent with the endpoint.
+    if preferred:
+        places = [
+            place for place in places
+            if (place.get("type") or "").strip().lower() in preferred
+        ]
 
     best_window, weather_cautions, best_weather = choose_forecast_window(
         hourly_points,
@@ -782,7 +1033,6 @@ def make_rankings(
     for place in places:
         feature_type = (place.get("type") or "").lower().strip()
         type_match = feature_type in preferred
-
         distance = float(place.get("distance_km") or 0)
 
         proximity_score = max(
@@ -790,11 +1040,12 @@ def make_rankings(
             100.0 * (1.0 - distance / max(radius_km, 0.5)),
         )
 
-        activity_score = (
-            100.0 if type_match
-            else 55.0 if not preferred
-            else 35.0
-        )
+        if type_match:
+            activity_score = 100.0
+        elif not preferred:
+            activity_score = 55.0
+        else:
+            activity_score = 35.0
 
         weather_score = 55.0
 
@@ -802,28 +1053,28 @@ def make_rankings(
             rain = best_weather.get("precip_prob")
             wind = best_weather.get("wind_speed_kmh")
             temp = best_weather.get("temp_c")
-
             penalties = 0.0
 
             penalties += (
                 min(55.0, float(rain) * 0.55)
                 if rain is not None else 15.0
             )
-
             penalties += (
                 min(25.0, max(0.0, float(wind) - 10.0))
                 if wind is not None else 8.0
             )
 
             if temp is not None and temp >= 32:
-                penalties += min(20.0, (float(temp) - 30.0) * 2.0)
+                penalties += min(
+                    20.0,
+                    (float(temp) - 30.0) * 2.0,
+                )
 
             if best_weather.get("is_daylight") is False:
                 penalties += 8.0
 
             weather_score = max(0.0, 100.0 - penalties)
 
-        # This is a heuristic ranking score, not a probability or safety rating.
         score = round(
             0.35 * proximity_score
             + 0.35 * activity_score
@@ -831,11 +1082,7 @@ def make_rankings(
             1,
         )
 
-        scored_places.append((
-            score,
-            place,
-            type_match,
-        ))
+        scored_places.append((score, place, type_match))
 
     scored_places.sort(
         key=lambda item: (
@@ -867,7 +1114,10 @@ def make_rankings(
                 "value": (
                     "Mapped feature type matches the activity preference"
                     if type_match
-                    else "Specific suitability is not established by mapped feature type"
+                    else (
+                        "Specific suitability is not established "
+                        "by mapped feature type"
+                    )
                 ),
                 "status": "good" if type_match else "unknown",
             },
@@ -899,11 +1149,10 @@ def make_rankings(
 
         carry = []
         watch_for = list(weather_cautions)
-
-        activity_lower = (activity or "").lower()
+        activity_lower = normalize_activity(activity)
 
         if activity_lower in {
-            "running", "jogging", "walking", "hiking", "cycling"
+            "running", "jogging", "walking", "hiking", "cycling",
         }:
             carry.extend([
                 "Water",
@@ -945,16 +1194,19 @@ def make_rankings(
             "watch_for": list(dict.fromkeys(watch_for)),
             "avoid_when": [],
             "activity_cautions": [
-                "Confirm opening hours, access rules, and on-site conditions before visiting."
+                "Confirm opening hours, access rules, and on-site conditions "
+                "before visiting."
             ],
-            "source_ids": ["osm"] + (["weather"] if hourly_points else []),
+            "source_ids": ["osm"] + (
+                ["weather"] if hourly_points else []
+            ),
         })
 
     return rankings
 
 
 # ============================================================
-# LOCAL QWEN MODEL INTEGRATION
+# OPTIONAL LOCAL QWEN MODEL INTEGRATION
 # ============================================================
 
 async def enrich_rankings_with_model(
@@ -964,20 +1216,17 @@ async def enrich_rankings_with_model(
     request,
 ):
     """
-    Use Qwen to improve explanations and practical advice.
-    Scores and ranks remain calculated by Python.
+    Let Qwen enrich explanations while Python retains authority
+    over ranking, score, names, distances, and forecast values.
     """
     if not OLLAMA_ENABLED or not rankings:
         return rankings, False
 
     place_by_id = {
-        place["id"]: place
-        for place in places
+        place["id"]: place for place in places
     }
-
     weather_by_time = {
-        point["time"]: point
-        for point in hourly_points
+        point["time"]: point for point in hourly_points
     }
 
     evidence = []
@@ -1011,14 +1260,13 @@ async def enrich_rankings_with_model(
     prompt = f"""
 You are Terrain, an evidence-grounded outdoor activity assistant.
 
-Use ONLY the supplied JSON evidence. Do not invent opening hours, facilities,
-surface conditions, route times, air quality, access rules, safety status,
-or local events. A mapped feature type does not prove a venue is open or
-suitable. The weather forecast is location-level, not a measurement at each
-individual place. Scores are deterministic heuristics, not probabilities
-or safety ratings.
+Use ONLY the supplied JSON evidence. Do not invent opening hours,
+facilities, surface conditions, route times, air quality, access rules,
+safety status, or local events. A mapped feature type does not prove
+a venue is open or suitable. Weather is location-level forecast data.
+Scores are deterministic heuristics, not probabilities or safety ratings.
 
-Return valid JSON only with this structure:
+Return valid JSON only:
 {{
   "recommendations": [
     {{
@@ -1032,9 +1280,10 @@ Return valid JSON only with this structure:
   ]
 }}
 
-Include each supplied place ID exactly once. Do not change ranks, scores,
-names, distances, or forecast values. Use empty arrays when no specific
-evidence supports a suggestion. Do not output Markdown. Keep advice concise.
+Include only supplied place IDs, at most once each. Do not change ranks,
+scores, names, distances, or forecast values. Use empty arrays when no
+specific evidence supports a suggestion. Do not output Markdown.
+Keep advice concise.
 
 User request: {request.query}
 Additional considerations: {request.considerations or "None"}
@@ -1043,7 +1292,7 @@ Evidence JSON: {json.dumps(evidence, ensure_ascii=False)}
 
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(45.0, connect=3.0)
+            timeout=httpx.Timeout(100.0, connect=3.0)
         ) as model_client:
             response = await model_client.post(
                 OLLAMA_URL,
@@ -1058,20 +1307,30 @@ Evidence JSON: {json.dumps(evidence, ensure_ascii=False)}
                     },
                 },
             )
-
             response.raise_for_status()
-
             raw_output = response.json().get("response", "")
             generated = json.loads(raw_output)
 
-        generated_by_id = {
-            item.get("place_id"): item
-            for item in generated.get("recommendations", [])
+        recommendations = generated.get("recommendations", [])
+
+        if not isinstance(recommendations, list):
+            return rankings, False
+
+        valid_ids = set(place_by_id)
+        generated_by_id = {}
+
+        for item in recommendations:
+            if not isinstance(item, dict):
+                continue
+
+            place_id = item.get("place_id")
+
             if (
-                isinstance(item, dict)
-                and item.get("place_id") in place_by_id
-            )
-        }
+                isinstance(place_id, str)
+                and place_id in valid_ids
+                and place_id not in generated_by_id
+            ):
+                generated_by_id[place_id] = item
 
         for ranking in rankings:
             item = generated_by_id.get(ranking["place_id"])
@@ -1094,13 +1353,13 @@ Evidence JSON: {json.dumps(evidence, ensure_ascii=False)}
 
                 if isinstance(value, list):
                     ranking[field] = [
-                        str(entry).strip()[:180]
+                        entry.strip()[:180]
                         for entry in value[:5]
                         if isinstance(entry, str) and entry.strip()
                     ]
 
         print(f"Terrain: local Qwen enrichment completed ({OLLAMA_MODEL}).")
-        return rankings, True
+        return rankings, bool(generated_by_id)
 
     except Exception as exc:
         print(
@@ -1124,42 +1383,49 @@ async def recommend(request: RecommendationQuery):
             follow_redirects=True,
         ) as client:
 
-            # 1. Resolve the user's location.
+            # 1. Resolve location.
             lat, lon, place_name = await geocode_location(
-                client,
-                request,
+                client, request
             )
 
-            # 2. Fetch current forecast data.
+            # 2. Retrieve hourly weather.
             weather_error = None
+            api_timezone = None
 
             try:
-                hourly_points, timezone_name = await get_weather(
-                    client,
-                    lat,
-                    lon,
+                hourly_points, api_timezone = await get_weather(
+                    client, lat, lon
                 )
-            except (httpx.HTTPError, ValueError, KeyError) as exc:
+            except (
+                httpx.HTTPError,
+                ValueError,
+                KeyError,
+                TypeError,
+            ) as exc:
                 hourly_points = []
-                timezone_name = "UTC"
                 weather_error = str(exc)
                 print(f"Weather lookup failed: {weather_error}")
 
-            # 3. Interpret the requested time window.
+            timezone_name = timezone_for_location(
+                lat, lon, api_timezone
+            )
+
+            # 3. Interpret the user's requested time.
             time_window, time_error = parse_time_window(
-                request,
-                timezone_name,
+                request, timezone_name
             )
 
-            # 4. Discover mapped outdoor places.
+            # 4. Find and validate nearby outdoor features.
             places, places_error = await find_nearby_places(
-                client,
-                lat,
-                lon,
-                request.radius_km,
+                client, lat, lon, request.radius_km
             )
 
-            # 5. Calculate scores deterministically.
+            # 5. Filter places for the requested activity before ranking.
+            places, activity_filter_note = filter_places_for_activity(
+                places, request.activity
+            )
+
+            # 6. Rank the filtered places deterministically.
             rankings = make_rankings(
                 places=places,
                 activity=request.activity,
@@ -1169,7 +1435,7 @@ async def recommend(request: RecommendationQuery):
                 radius_km=request.radius_km,
             )
 
-            # 6. Let local Qwen improve explanations if available.
+            # 7. Optionally enrich explanations.
             rankings, model_used = await enrich_rankings_with_model(
                 rankings=rankings,
                 places=places,
@@ -1177,8 +1443,7 @@ async def recommend(request: RecommendationQuery):
                 request=request,
             )
 
-            # Keep the existing frontend's expected data shape.
-            # These are location-level forecasts, not park-specific measurements.
+            # Preserve the existing frontend's expected data shape.
             hourly_by_place = {
                 "location": hourly_points,
                 **{
@@ -1223,6 +1488,7 @@ async def recommend(request: RecommendationQuery):
                         "name": place_name,
                         "lat": lat,
                         "lon": lon,
+                        "timezone": timezone_name,
                     },
                     "radius_km": request.radius_km,
                     "time_window": time_window,
@@ -1242,13 +1508,16 @@ async def recommend(request: RecommendationQuery):
                 "scoring_note": (
                     "Scores are heuristic ranking scores based on distance, "
                     "mapped feature-type match, and available location-level "
-                    "forecast data. They are not probabilities, verified venue "
-                    "suitability, or safety ratings."
+                    "forecast data. They are not probabilities, verified "
+                    "venue suitability, or safety ratings."
                 ),
             }
 
             if places_error:
                 result["places_error"] = places_error
+
+            if activity_filter_note:
+                result["activity_filter_note"] = activity_filter_note
 
             if weather_error:
                 result["weather_error"] = weather_error
@@ -1264,18 +1533,24 @@ async def recommend(request: RecommendationQuery):
     except httpx.HTTPError as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"An external data service failed: {str(exc)[:300]}",
+            detail=(
+                "An external data service failed: "
+                f"{str(exc)[:300]}"
+            ),
         ) from exc
 
-    except (ValueError, KeyError) as exc:
+    except (ValueError, KeyError, TypeError) as exc:
         raise HTTPException(
             status_code=502,
-            detail=f"Could not process an external data response: {str(exc)[:300]}",
+            detail=(
+                "Could not process an external data response: "
+                f"{str(exc)[:300]}"
+            ),
         ) from exc
 
     except Exception as exc:
         print(
-            f"Unexpected recommendation error: "
+            "Unexpected recommendation error: "
             f"{type(exc).__name__}: {exc}"
         )
 
