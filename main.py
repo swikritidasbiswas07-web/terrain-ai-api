@@ -16,14 +16,14 @@ from pydantic import BaseModel, Field
 # TERRAIN CONFIGURATION
 # ============================================================
 
-APP_VERSION = "3.5.0"
+APP_VERSION = "3.6.0"
 
 app = FastAPI(
     title="Terrain Outdoor Activity API",
     version=APP_VERSION,
     description=(
         "Evidence-grounded outdoor recommendations using live "
-        "geospatial and weather data with optional Qwen inference via Hugging Face."
+        "geospatial and weather data with optional Llama 3.2 1B explanation enrichment via Cloudflare Workers AI."
     ),
 )
 
@@ -46,18 +46,24 @@ OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 USER_AGENT = "TerrainOutdoorAssistant/3.2 (outdoor activity research project)"
 INDIA_TIMEZONE = "Asia/Kolkata"
 
-# Hosted open-weight model inference. Keep the token in the deployment
-# environment; never hard-code it or return it from an API response.
-HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
-HF_MODEL = os.getenv(
-    "TERRAIN_HF_MODEL",
-    "Qwen/Qwen2.5-1.5B-Instruct",
+# Cloudflare Workers AI REST API. Keep credentials in Render environment variables.
+CLOUDFLARE_ACCOUNT_ID = os.getenv("CLOUDFLARE_ACCOUNT_ID", "").strip()
+CLOUDFLARE_API_TOKEN = os.getenv("CLOUDFLARE_API_TOKEN", "").strip()
+CLOUDFLARE_MODEL = os.getenv(
+    "TERRAIN_CLOUDFLARE_MODEL",
+    "@cf/meta/llama-3.2-1b-instruct",
 ).strip()
-HF_CHAT_COMPLETIONS_URL = "https://router.huggingface.co/v1/chat/completions"
-HF_ENABLED = os.getenv(
-    "TERRAIN_HF_ENABLED",
+CLOUDFLARE_ENABLED = os.getenv(
+    "TERRAIN_CLOUDFLARE_ENABLED",
     "true",
 ).lower() not in {"0", "false", "no", "off"}
+
+
+def cloudflare_ai_url() -> str:
+    return (
+        f"https://api.cloudflare.com/client/v4/accounts/"
+        f"{CLOUDFLARE_ACCOUNT_ID}/ai/run/{CLOUDFLARE_MODEL}"
+    )
 
 
 class RecommendationQuery(BaseModel):
@@ -460,70 +466,71 @@ def health():
 
 @app.get("/model-status")
 async def model_status():
-    """Actively verify that the configured Hugging Face model can respond."""
-    if not HF_ENABLED:
+    """Actively verify that the configured Cloudflare Workers AI model responds."""
+    if not CLOUDFLARE_ENABLED:
         return {
             "enabled": False,
             "available": False,
-            "model": HF_MODEL,
-            "provider": "Hugging Face Inference Providers",
+            "model": CLOUDFLARE_MODEL,
+            "provider": "Cloudflare Workers AI",
             "detail": "Model inference is disabled by configuration.",
         }
 
-    if not HF_TOKEN:
+    if not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_TOKEN:
         return {
             "enabled": True,
             "available": False,
-            "model": HF_MODEL,
-            "provider": "Hugging Face Inference Providers",
-            "detail": "HF_TOKEN is not configured in the deployment environment.",
+            "model": CLOUDFLARE_MODEL,
+            "provider": "Cloudflare Workers AI",
+            "detail": "CLOUDFLARE_ACCOUNT_ID and/or CLOUDFLARE_API_TOKEN are not configured.",
         }
 
     try:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=8.0)) as client:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(35.0, connect=8.0)) as client:
             response = await client.post(
-                HF_CHAT_COMPLETIONS_URL,
+                cloudflare_ai_url(),
                 headers={
-                    "Authorization": f"Bearer {HF_TOKEN}",
+                    "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": HF_MODEL,
-                    "messages": [{"role": "user", "content": "Reply with OK."}],
-                    "max_tokens": 2,
+                    "messages": [
+                        {"role": "system", "content": "Reply with only OK."},
+                        {"role": "user", "content": "Test connection."},
+                    ],
+                    "max_tokens": 8,
                     "temperature": 0,
                 },
             )
             response.raise_for_status()
             payload = response.json()
-            content = payload.get("choices", [{}])[0].get("message", {}).get("content")
+            result = payload.get("result", {}) if isinstance(payload, dict) else {}
+            content = result.get("response") if isinstance(result, dict) else None
             available = isinstance(content, str) and bool(content.strip())
 
         return {
             "enabled": True,
             "available": available,
-            "model": HF_MODEL,
-            "provider": "Hugging Face Inference Providers",
-            "detail": "Inference test succeeded." if available else "Provider returned no text content.",
+            "model": CLOUDFLARE_MODEL,
+            "provider": "Cloudflare Workers AI",
+            "detail": "Inference test succeeded." if available else "Cloudflare returned no text content.",
         }
 
     except httpx.HTTPStatusError as exc:
-        # Avoid returning request headers or the token; provider error bodies can
-        # contain useful model-routing details but are kept short.
         detail = exc.response.text[:250] if exc.response is not None else str(exc)[:200]
         return {
             "enabled": True,
             "available": False,
-            "model": HF_MODEL,
-            "provider": "Hugging Face Inference Providers",
-            "detail": f"Inference provider returned HTTP {exc.response.status_code}: {detail}",
+            "model": CLOUDFLARE_MODEL,
+            "provider": "Cloudflare Workers AI",
+            "detail": f"Cloudflare returned HTTP {exc.response.status_code}: {detail}",
         }
     except Exception as exc:
         return {
             "enabled": True,
             "available": False,
-            "model": HF_MODEL,
-            "provider": "Hugging Face Inference Providers",
+            "model": CLOUDFLARE_MODEL,
+            "provider": "Cloudflare Workers AI",
             "detail": f"Inference check failed: {type(exc).__name__}: {str(exc)[:180]}",
         }
 
@@ -1239,8 +1246,8 @@ async def enrich_rankings_with_model(
     hourly_points,
     request,
 ):
-    """Use Qwen for evidence-grounded explanations; Python owns all scores/ranks."""
-    if not HF_ENABLED or not HF_TOKEN or not rankings:
+    """Use Llama for evidence-grounded explanations; Python owns all scores/ranks."""
+    if not CLOUDFLARE_ENABLED or not CLOUDFLARE_ACCOUNT_ID or not CLOUDFLARE_API_TOKEN or not rankings:
         return rankings, False
 
     place_by_id = {place["id"]: place for place in places}
@@ -1288,17 +1295,16 @@ Evidence JSON: {json.dumps(evidence, ensure_ascii=False)}
 
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(75.0, connect=8.0),
+            timeout=httpx.Timeout(60.0, connect=8.0),
             follow_redirects=True,
         ) as model_client:
             response = await model_client.post(
-                HF_CHAT_COMPLETIONS_URL,
+                cloudflare_ai_url(),
                 headers={
-                    "Authorization": f"Bearer {HF_TOKEN}",
+                    "Authorization": f"Bearer {CLOUDFLARE_API_TOKEN}",
                     "Content-Type": "application/json",
                 },
                 json={
-                    "model": HF_MODEL,
                     "messages": [
                         {"role": "system", "content": "Return only valid JSON matching the requested schema."},
                         {"role": "user", "content": prompt},
@@ -1309,12 +1315,11 @@ Evidence JSON: {json.dumps(evidence, ensure_ascii=False)}
             )
             response.raise_for_status()
             payload = response.json()
-            raw_output = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
+            result = payload.get("result", {}) if isinstance(payload, dict) else {}
+            raw_output = result.get("response", "") if isinstance(result, dict) else ""
             if not isinstance(raw_output, str) or not raw_output.strip():
                 return rankings, False
 
-        # Parse direct JSON first; tolerate a provider/model adding code fences
-        # or a short preamble, without accepting invented place IDs.
         try:
             generated = json.loads(raw_output.strip())
         except json.JSONDecodeError:
@@ -1354,12 +1359,12 @@ Evidence JSON: {json.dumps(evidence, ensure_ascii=False)}
                     ]
 
         model_used = bool(generated_by_id)
-        print(f"Terrain: Hugging Face Qwen enrichment {'completed' if model_used else 'returned no usable recommendations'} ({HF_MODEL}).")
+        print(f"Terrain: Cloudflare Llama enrichment {'completed' if model_used else 'returned no usable recommendations'} ({CLOUDFLARE_MODEL}).")
         return rankings, model_used
 
     except Exception as exc:
         print(
-            "Terrain: Hugging Face Qwen unavailable; using deterministic fallback. "
+            "Terrain: Cloudflare Workers AI unavailable; using deterministic fallback. "
             f"{type(exc).__name__}: {str(exc)[:250]}"
         )
         return rankings, False
@@ -1470,9 +1475,9 @@ async def recommend(request: RecommendationQuery):
             if model_used:
                 sources.append(
                     source_record(
-                        "qwen-huggingface",
-                        f"{HF_MODEL} via Hugging Face Inference Providers",
-                        "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct",
+                        "cloudflare-workers-ai",
+                        f"{CLOUDFLARE_MODEL} via Cloudflare Workers AI",
+                        "https://developers.cloudflare.com/workers-ai/models/llama-3.2-1b-instruct/",
                         generated_at,
                     )
                 )
@@ -1501,8 +1506,8 @@ async def recommend(request: RecommendationQuery):
                 "generated_at": generated_at,
                 "simulated": False,
                 "model_used": model_used,
-                "model": HF_MODEL if model_used else None,
-                "model_provider": "Hugging Face Inference Providers" if model_used else None,
+                "model": CLOUDFLARE_MODEL if model_used else None,
+                "model_provider": "Cloudflare Workers AI" if model_used else None,
                 "scoring_note": (
                     "Scores are heuristic ranking scores based on distance, "
                     "mapped feature-type match, and available location-level "
