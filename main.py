@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from math import atan2, cos, isfinite, radians, sin, sqrt
 from typing import Any
@@ -16,7 +17,11 @@ from pydantic import BaseModel, Field
 # TERRAIN CONFIGURATION
 # ============================================================
 
+<<<<<<< HEAD
 APP_VERSION = "3.6.0"
+=======
+APP_VERSION = "3.6.1"
+>>>>>>> 9806215 (Fix Llama JSON response parsing)
 
 app = FastAPI(
     title="Terrain Outdoor Activity API",
@@ -66,6 +71,68 @@ def cloudflare_ai_url() -> str:
     )
 
 
+<<<<<<< HEAD
+=======
+def parse_model_json(raw_output: str) -> dict[str, Any] | None:
+    """Parse model JSON, tolerating Markdown fences and minor/truncated JSON errors.
+
+    This helper only parses the explanation payload. It never changes scores or ranks.
+    Requires the ``json-repair`` package, listed in requirements.txt.
+    """
+    if not isinstance(raw_output, str) or not raw_output.strip():
+        return None
+
+    cleaned = raw_output.strip()
+    # Models occasionally wrap otherwise-valid JSON in Markdown code fences.
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned).strip()
+
+    candidates = [cleaned]
+    first = cleaned.find("{")
+    last = cleaned.rfind("}")
+    if first >= 0 and last > first:
+        extracted = cleaned[first:last + 1]
+        if extracted not in candidates:
+            candidates.append(extracted)
+    elif first >= 0:
+        # Include the tail from the first object brace; json-repair may close it.
+        extracted = cleaned[first:]
+        if extracted not in candidates:
+            candidates.append(extracted)
+
+    for candidate in candidates:
+        try:
+            parsed = json.loads(candidate)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # Use a repair library for missing commas/braces or truncated model output.
+    try:
+        from json_repair import repair_json
+
+        for candidate in candidates:
+            try:
+                repaired = repair_json(candidate)
+                parsed = json.loads(repaired) if isinstance(repaired, str) else repaired
+                if isinstance(parsed, dict):
+                    print("Terrain: repaired malformed Llama JSON response.")
+                    return parsed
+            except Exception:
+                continue
+    except ImportError:
+        print("Terrain: json-repair is not installed; cannot repair malformed model JSON.")
+    except Exception as exc:
+        print(
+            "Terrain: JSON repair failed; using deterministic fallback. "
+            f"{type(exc).__name__}: {str(exc)[:160]}"
+        )
+
+    return None
+
+
+>>>>>>> 9806215 (Fix Llama JSON response parsing)
 class RecommendationQuery(BaseModel):
     query: str = "Find a good place for an outdoor activity"
     activity: str | None = "Running"
@@ -1254,7 +1321,7 @@ async def enrich_rankings_with_model(
     weather_by_time = {point["time"]: point for point in hourly_points}
     evidence = []
 
-    for ranking in rankings[:10]:
+    for ranking in rankings[:5]:
         place = place_by_id.get(ranking["place_id"], {})
         window = ranking.get("best_window")
         weather = weather_by_time.get(window.get("start")) if window else None
@@ -1310,7 +1377,11 @@ Evidence JSON: {json.dumps(evidence, ensure_ascii=False)}
                         {"role": "user", "content": prompt},
                     ],
                     "temperature": 0.1,
+<<<<<<< HEAD
                     "max_tokens": 1800,
+=======
+                    "max_tokens": 1200,
+>>>>>>> 9806215 (Fix Llama JSON response parsing)
                 },
             )
             response.raise_for_status()
@@ -1319,6 +1390,7 @@ Evidence JSON: {json.dumps(evidence, ensure_ascii=False)}
             raw_output = result.get("response", "") if isinstance(result, dict) else ""
             if not isinstance(raw_output, str) or not raw_output.strip():
                 return rankings, False
+<<<<<<< HEAD
 
         try:
             generated = json.loads(raw_output.strip())
@@ -1330,6 +1402,18 @@ Evidence JSON: {json.dumps(evidence, ensure_ascii=False)}
             generated = json.loads(raw_output[first:last + 1])
 
         recommendations = generated.get("recommendations", []) if isinstance(generated, dict) else []
+=======
+
+        generated = parse_model_json(raw_output)
+        if generated is None:
+            print(
+                "Terrain: Llama response was not parseable JSON; "
+                "using deterministic fallback."
+            )
+            return rankings, False
+
+        recommendations = generated.get("recommendations", [])
+>>>>>>> 9806215 (Fix Llama JSON response parsing)
         if not isinstance(recommendations, list):
             return rankings, False
 
