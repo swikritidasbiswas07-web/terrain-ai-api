@@ -17,11 +17,7 @@ from pydantic import BaseModel, Field
 # TERRAIN CONFIGURATION
 # ============================================================
 
-<<<<<<< HEAD
-APP_VERSION = "3.6.0"
-=======
 APP_VERSION = "3.6.1"
->>>>>>> 9806215 (Fix Llama JSON response parsing)
 
 app = FastAPI(
     title="Terrain Outdoor Activity API",
@@ -71,8 +67,6 @@ def cloudflare_ai_url() -> str:
     )
 
 
-<<<<<<< HEAD
-=======
 def parse_model_json(raw_output: str) -> dict[str, Any] | None:
     """Parse model JSON, tolerating Markdown fences and minor/truncated JSON errors.
 
@@ -132,7 +126,6 @@ def parse_model_json(raw_output: str) -> dict[str, Any] | None:
     return None
 
 
->>>>>>> 9806215 (Fix Llama JSON response parsing)
 class RecommendationQuery(BaseModel):
     query: str = "Find a good place for an outdoor activity"
     activity: str | None = "Running"
@@ -1377,11 +1370,7 @@ Evidence JSON: {json.dumps(evidence, ensure_ascii=False)}
                         {"role": "user", "content": prompt},
                     ],
                     "temperature": 0.1,
-<<<<<<< HEAD
-                    "max_tokens": 1800,
-=======
                     "max_tokens": 1200,
->>>>>>> 9806215 (Fix Llama JSON response parsing)
                 },
             )
             response.raise_for_status()
@@ -1390,19 +1379,6 @@ Evidence JSON: {json.dumps(evidence, ensure_ascii=False)}
             raw_output = result.get("response", "") if isinstance(result, dict) else ""
             if not isinstance(raw_output, str) or not raw_output.strip():
                 return rankings, False
-<<<<<<< HEAD
-
-        try:
-            generated = json.loads(raw_output.strip())
-        except json.JSONDecodeError:
-            first = raw_output.find("{")
-            last = raw_output.rfind("}")
-            if first < 0 or last <= first:
-                return rankings, False
-            generated = json.loads(raw_output[first:last + 1])
-
-        recommendations = generated.get("recommendations", []) if isinstance(generated, dict) else []
-=======
 
         generated = parse_model_json(raw_output)
         if generated is None:
@@ -1413,7 +1389,6 @@ Evidence JSON: {json.dumps(evidence, ensure_ascii=False)}
             return rankings, False
 
         recommendations = generated.get("recommendations", [])
->>>>>>> 9806215 (Fix Llama JSON response parsing)
         if not isinstance(recommendations, list):
             return rankings, False
 
