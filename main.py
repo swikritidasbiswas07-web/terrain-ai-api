@@ -16,14 +16,14 @@ from pydantic import BaseModel, Field
 # TERRAIN CONFIGURATION
 # ============================================================
 
-APP_VERSION = "3.4.0"
+APP_VERSION = "3.5.0"
 
 app = FastAPI(
     title="Terrain Outdoor Activity API",
     version=APP_VERSION,
     description=(
         "Evidence-grounded outdoor recommendations using live "
-        "geospatial and weather data with optional local Qwen AI."
+        "geospatial and weather data with optional Qwen inference via Hugging Face."
     ),
 )
 
@@ -46,16 +46,16 @@ OPEN_METEO_URL = "https://api.open-meteo.com/v1/forecast"
 USER_AGENT = "TerrainOutdoorAssistant/3.2 (outdoor activity research project)"
 INDIA_TIMEZONE = "Asia/Kolkata"
 
-OLLAMA_URL = os.getenv(
-    "TERRAIN_OLLAMA_URL",
-    "http://127.0.0.1:11434/api/generate",
-)
-OLLAMA_MODEL = os.getenv(
-    "TERRAIN_OLLAMA_MODEL",
-    "qwen2.5:1.5b",
-)
-OLLAMA_ENABLED = os.getenv(
-    "TERRAIN_OLLAMA_ENABLED",
+# Hosted open-weight model inference. Keep the token in the deployment
+# environment; never hard-code it or return it from an API response.
+HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
+HF_MODEL = os.getenv(
+    "TERRAIN_HF_MODEL",
+    "Qwen/Qwen2.5-1.5B-Instruct",
+).strip()
+HF_CHAT_COMPLETIONS_URL = "https://router.huggingface.co/v1/chat/completions"
+HF_ENABLED = os.getenv(
+    "TERRAIN_HF_ENABLED",
     "true",
 ).lower() not in {"0", "false", "no", "off"}
 
@@ -460,47 +460,71 @@ def health():
 
 @app.get("/model-status")
 async def model_status():
-    if not OLLAMA_ENABLED:
+    """Actively verify that the configured Hugging Face model can respond."""
+    if not HF_ENABLED:
         return {
             "enabled": False,
             "available": False,
-            "model": OLLAMA_MODEL,
+            "model": HF_MODEL,
+            "provider": "Hugging Face Inference Providers",
+            "detail": "Model inference is disabled by configuration.",
         }
 
-    tags_url = (
-        OLLAMA_URL.rsplit("/api/generate", 1)[0]
-        + "/api/tags"
-    )
+    if not HF_TOKEN:
+        return {
+            "enabled": True,
+            "available": False,
+            "model": HF_MODEL,
+            "provider": "Hugging Face Inference Providers",
+            "detail": "HF_TOKEN is not configured in the deployment environment.",
+        }
 
     try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            response = await client.get(tags_url)
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=8.0)) as client:
+            response = await client.post(
+                HF_CHAT_COMPLETIONS_URL,
+                headers={
+                    "Authorization": f"Bearer {HF_TOKEN}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": HF_MODEL,
+                    "messages": [{"role": "user", "content": "Reply with OK."}],
+                    "max_tokens": 2,
+                    "temperature": 0,
+                },
+            )
             response.raise_for_status()
-
-        names = [
-            item.get("name", "")
-            for item in response.json().get("models", [])
-        ]
-
-        available = any(
-            name == OLLAMA_MODEL
-            or name.startswith(OLLAMA_MODEL + ":")
-            for name in names
-        )
+            payload = response.json()
+            content = payload.get("choices", [{}])[0].get("message", {}).get("content")
+            available = isinstance(content, str) and bool(content.strip())
 
         return {
             "enabled": True,
             "available": available,
-            "model": OLLAMA_MODEL,
-            "installed_models": names,
+            "model": HF_MODEL,
+            "provider": "Hugging Face Inference Providers",
+            "detail": "Inference test succeeded." if available else "Provider returned no text content.",
         }
 
+    except httpx.HTTPStatusError as exc:
+        # Avoid returning request headers or the token; provider error bodies can
+        # contain useful model-routing details but are kept short.
+        detail = exc.response.text[:250] if exc.response is not None else str(exc)[:200]
+        return {
+            "enabled": True,
+            "available": False,
+            "model": HF_MODEL,
+            "provider": "Hugging Face Inference Providers",
+            "detail": f"Inference provider returned HTTP {exc.response.status_code}: {detail}",
+        }
     except Exception as exc:
         return {
             "enabled": True,
             "available": False,
-            "model": OLLAMA_MODEL,
-            "detail": str(exc)[:200],
+            "model": HF_MODEL,
+            "provider": "Hugging Face Inference Providers",
+            "detail": f"Inference check failed: {type(exc).__name__}: {str(exc)[:180]}",
         }
 
 
@@ -1206,7 +1230,7 @@ def make_rankings(
 
 
 # ============================================================
-# OPTIONAL LOCAL QWEN MODEL INTEGRATION
+# OPTIONAL QWEN INFERENCE VIA HUGGING FACE
 # ============================================================
 
 async def enrich_rankings_with_model(
@@ -1215,31 +1239,18 @@ async def enrich_rankings_with_model(
     hourly_points,
     request,
 ):
-    """
-    Let Qwen enrich explanations while Python retains authority
-    over ranking, score, names, distances, and forecast values.
-    """
-    if not OLLAMA_ENABLED or not rankings:
+    """Use Qwen for evidence-grounded explanations; Python owns all scores/ranks."""
+    if not HF_ENABLED or not HF_TOKEN or not rankings:
         return rankings, False
 
-    place_by_id = {
-        place["id"]: place for place in places
-    }
-    weather_by_time = {
-        point["time"]: point for point in hourly_points
-    }
-
+    place_by_id = {place["id"]: place for place in places}
+    weather_by_time = {point["time"]: point for point in hourly_points}
     evidence = []
 
     for ranking in rankings[:10]:
         place = place_by_id.get(ranking["place_id"], {})
         window = ranking.get("best_window")
-
-        weather = (
-            weather_by_time.get(window.get("start"))
-            if window else None
-        )
-
+        weather = weather_by_time.get(window.get("start")) if window else None
         evidence.append({
             "place_id": ranking["place_id"],
             "name": place.get("name"),
@@ -1257,33 +1268,18 @@ async def enrich_rankings_with_model(
             } if weather else None,
         })
 
-    prompt = f"""
-You are Terrain, an evidence-grounded outdoor activity assistant.
+    prompt = f"""You are Terrain, an evidence-grounded outdoor activity assistant.
+Use ONLY the supplied JSON evidence. Do not invent opening hours, facilities,
+surface conditions, route times, air quality, access rules, safety status, or
+local events. A mapped feature type does not prove a venue is open or suitable.
+Weather is location-level forecast data. Scores are deterministic heuristics,
+not probabilities or safety ratings.
 
-Use ONLY the supplied JSON evidence. Do not invent opening hours,
-facilities, surface conditions, route times, air quality, access rules,
-safety status, or local events. A mapped feature type does not prove
-a venue is open or suitable. Weather is location-level forecast data.
-Scores are deterministic heuristics, not probabilities or safety ratings.
-
-Return valid JSON only:
-{{
-  "recommendations": [
-    {{
-      "place_id": "exact supplied ID",
-      "reasoning": "two short evidence-grounded sentences",
-      "carry": ["practical items"],
-      "watch_for": ["evidence-grounded considerations"],
-      "avoid_when": ["evidence-supported conditions"],
-      "activity_cautions": ["limitations or checks"]
-    }}
-  ]
-}}
-
-Include only supplied place IDs, at most once each. Do not change ranks,
-scores, names, distances, or forecast values. Use empty arrays when no
-specific evidence supports a suggestion. Do not output Markdown.
-Keep advice concise.
+Return valid JSON only in this schema:
+{{"recommendations":[{{"place_id":"exact supplied ID","reasoning":"two short evidence-grounded sentences","carry":["practical items"],"watch_for":["evidence-grounded considerations"],"avoid_when":["evidence-supported conditions"],"activity_cautions":["limitations or checks"]}}]}}
+Include only supplied place IDs, at most once each. Do not change ranks, scores,
+names, distances, or forecast values. Use empty arrays when no specific evidence
+supports a suggestion. Do not output Markdown. Keep advice concise.
 
 User request: {request.query}
 Additional considerations: {request.considerations or "None"}
@@ -1292,65 +1288,64 @@ Evidence JSON: {json.dumps(evidence, ensure_ascii=False)}
 
     try:
         async with httpx.AsyncClient(
-            timeout=httpx.Timeout(100.0, connect=3.0)
+            timeout=httpx.Timeout(75.0, connect=8.0),
+            follow_redirects=True,
         ) as model_client:
             response = await model_client.post(
-                OLLAMA_URL,
+                HF_CHAT_COMPLETIONS_URL,
+                headers={
+                    "Authorization": f"Bearer {HF_TOKEN}",
+                    "Content-Type": "application/json",
+                },
                 json={
-                    "model": OLLAMA_MODEL,
-                    "prompt": prompt,
-                    "stream": False,
-                    "format": "json",
-                    "options": {
-                        "temperature": 0.1,
-                        "num_predict": 1600,
-                    },
+                    "model": HF_MODEL,
+                    "messages": [
+                        {"role": "system", "content": "Return only valid JSON matching the requested schema."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    "temperature": 0.1,
+                    "max_tokens": 1800,
                 },
             )
             response.raise_for_status()
-            raw_output = response.json().get("response", "")
-            generated = json.loads(raw_output)
+            payload = response.json()
+            raw_output = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if not isinstance(raw_output, str) or not raw_output.strip():
+                return rankings, False
 
-        recommendations = generated.get("recommendations", [])
+        # Parse direct JSON first; tolerate a provider/model adding code fences
+        # or a short preamble, without accepting invented place IDs.
+        try:
+            generated = json.loads(raw_output.strip())
+        except json.JSONDecodeError:
+            first = raw_output.find("{")
+            last = raw_output.rfind("}")
+            if first < 0 or last <= first:
+                return rankings, False
+            generated = json.loads(raw_output[first:last + 1])
 
+        recommendations = generated.get("recommendations", []) if isinstance(generated, dict) else []
         if not isinstance(recommendations, list):
             return rankings, False
 
         valid_ids = set(place_by_id)
         generated_by_id = {}
-
         for item in recommendations:
             if not isinstance(item, dict):
                 continue
-
             place_id = item.get("place_id")
-
-            if (
-                isinstance(place_id, str)
-                and place_id in valid_ids
-                and place_id not in generated_by_id
-            ):
+            if isinstance(place_id, str) and place_id in valid_ids and place_id not in generated_by_id:
                 generated_by_id[place_id] = item
 
         for ranking in rankings:
             item = generated_by_id.get(ranking["place_id"])
-
             if not item:
                 continue
-
             reasoning = item.get("reasoning")
-
             if isinstance(reasoning, str) and reasoning.strip():
                 ranking["reasoning"] = reasoning.strip()[:700]
-
-            for field in (
-                "carry",
-                "watch_for",
-                "avoid_when",
-                "activity_cautions",
-            ):
+            for field in ("carry", "watch_for", "avoid_when", "activity_cautions"):
                 value = item.get(field)
-
                 if isinstance(value, list):
                     ranking[field] = [
                         entry.strip()[:180]
@@ -1358,13 +1353,14 @@ Evidence JSON: {json.dumps(evidence, ensure_ascii=False)}
                         if isinstance(entry, str) and entry.strip()
                     ]
 
-        print(f"Terrain: local Qwen enrichment completed ({OLLAMA_MODEL}).")
-        return rankings, bool(generated_by_id)
+        model_used = bool(generated_by_id)
+        print(f"Terrain: Hugging Face Qwen enrichment {'completed' if model_used else 'returned no usable recommendations'} ({HF_MODEL}).")
+        return rankings, model_used
 
     except Exception as exc:
         print(
-            "Terrain: Qwen unavailable; using deterministic fallback. "
-            f"{str(exc)[:250]}"
+            "Terrain: Hugging Face Qwen unavailable; using deterministic fallback. "
+            f"{type(exc).__name__}: {str(exc)[:250]}"
         )
         return rankings, False
 
@@ -1474,8 +1470,8 @@ async def recommend(request: RecommendationQuery):
             if model_used:
                 sources.append(
                     source_record(
-                        "qwen-local",
-                        f"{OLLAMA_MODEL} via local Ollama",
+                        "qwen-huggingface",
+                        f"{HF_MODEL} via Hugging Face Inference Providers",
                         "https://huggingface.co/Qwen/Qwen2.5-1.5B-Instruct",
                         generated_at,
                     )
@@ -1505,6 +1501,8 @@ async def recommend(request: RecommendationQuery):
                 "generated_at": generated_at,
                 "simulated": False,
                 "model_used": model_used,
+                "model": HF_MODEL if model_used else None,
+                "model_provider": "Hugging Face Inference Providers" if model_used else None,
                 "scoring_note": (
                     "Scores are heuristic ranking scores based on distance, "
                     "mapped feature-type match, and available location-level "
